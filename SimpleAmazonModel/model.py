@@ -10,9 +10,11 @@ import tree_math
 from flax import struct
 
 import xarray as xr
+import jax
 
 logger = logging.getLogger(__name__)
 
+ATMOSPHERE_MASS = 1e4 # kg/m^2
 PyTree = Any
 Carry = PyTree
 Diagnostics = PyTree
@@ -62,8 +64,10 @@ class Derived:
 class Parameters:
     
     atmosphere_humidity_relaxation_time: float | jnp.ndarray = 60 * 86400.0
-    atmosphere_windspeed: float | jnp.ndarray = 60 * 86400.0
+    incoming_atmosphere_specific_humidity: float | jnp.ndarray = 0.02
+    atmosphere_windspeed: float | jnp.ndarray = 1.0 # m s^-1
     soil_depth: float | jnp.ndarray = 3.0 # meters
+    soil_relaxation_time: float | jnp.ndarray = 5 * 86400.0 # s
     biomass_growth_time: float | jnp.ndarray = 2 * 360 * 86400.0
     biomass_maximum: float | jnp.ndarray = 30.0 # kg / m^2
 
@@ -90,9 +94,11 @@ class Model:
 
     def initialize(self, params: Parameters | None = None) -> Carry:
         
-        shape = (self.ngrid,)
+        shape = self.grid_shape
  
-        state = State.zeros(shape)
+        init_atmosphere_specific_humidity = jnp.zeros(shape)
+
+        state = State.zeros(shape, atmosphere_specific_humidity = init_atmosphere_specific_humidity)
         derived = Derived.zeros(shape)
         params = Parameters.default() if params is None else params
         
@@ -101,17 +107,76 @@ class Model:
             "params": params,
         }
 
+    def _interpolate_onto_U_grid(self, q_T):
+        
+        q_U = jnp.zeros((self.ngrid+1,))
+        q_U = q_U.at[1:-1].set((q_T[1:] + q_T[:-1]) / 2)
+        q_U = q_U.at[0].set(q_T[0])
+        q_U = q_U.at[-1].set(q_T[-1])
+        #jax.debug.print("q_U[0] = {x}", x=q_U[0])
+        return q_U
+
+    def _ddx_T_to_T(self, q_T):
+        
+        q_U = self._interpolate_onto_U_grid(q_T)
+        dqdx_T = (q_U[1:] - q_U[:-1]) / self.grid_length
+        
+        return dqdx_T
+
+    def _ddx_T_to_U(self, q_T):
+        dqdx_U = jnp.zeros((self.ngrid+1,))
+        dqdx_U = dqdx_U.at[1:-1].set( (q_T[1:] - q_T[:-1]) / self.grid_length )
+        dqdx_U = dqdx_U.at[0].set(0)
+        dqdx_U = dqdx_U.at[-1].set(0)
+        return dqdx_U
+ 
+    def _ddx_U_to_T(self, q_U):
+        return (q_U[1:] - q_U[:-1]) / self.grid_length 
+ 
     def step(self, carry: Carry, step: int) -> tuple[Carry, Diagnostics]:
         
         params = carry["params"]
         state = carry["state"]
+        dt = self.time_step
+        
+        new_time = state.time + dt
+        flux = - params.atmosphere_windspeed * self._interpolate_onto_U_grid(state.atmosphere_specific_humidity)
+        advection_tendency = self._ddx_U_to_T(flux)
+        
+        """
+        x_n+1 - x_n = - x_n+1 * dt / tau
+        x_n+1 (1 + dt/tau) = x_n
+        x_n+1 = x_n / (1 + dt/tau)
+        
+        dx_n = x_n+1 - x_n = x_n / (1+dt/tau) - x_n = x_n (1 / (1+dt/tau) - 1)
+        x_n - x_n+1 = x_n (1 - (1+dt/tau)**(-1)) 
+        """
+        
+        # Force a 5mm / day precipitation
+        precipitation = state.atmosphere_specific_humidity * ATMOSPHERE_MASS * (
+            1.0 - 1.0 / (1.0 + dt/params.atmosphere_humidity_relaxation_time)
+        ) / dt # m s^-1
+ 
+        new_atmosphere_specific_humidity = state.atmosphere_specific_humidity + dt * (
+            advection_tendency
+            - precipitation / ATMOSPHERE_MASS 
+        )
+        new_atmosphere_specific_humidity = new_atmosphere_specific_humidity.at[0].set(params.incoming_atmosphere_specific_humidity)
 
-        new_time = state.time + self.time_step
+        new_soil_water_content = (
+            state.soil_water_content / ( 1.0 + dt / params.soil_relaxation_time) 
+            + precipitation * dt
+        )
+
         new_state = state.replace(
             time = new_time,
+            soil_water_content = new_soil_water_content,
+            atmosphere_specific_humidity = new_atmosphere_specific_humidity,
         ) 
-        
-        derived = Derived.zeros(shape=self.grid_shape)
+        derived = Derived.zeros(
+            shape=self.grid_shape,
+            precipitation = precipitation,
+        )
 
         new_carry = {
             "state": new_state,
@@ -142,6 +207,23 @@ class Model:
                         "units": "m",
                     },
                 ),
+                "precipitation": (
+                    gridded_dims,
+                    derived.precipitation * 86400.0 * 1000,
+                    {
+                        "long_name": "Precipitation",
+                        "units": "mm day^-1",
+                    },
+                ),
+                "atmosphere_specific_humidity": (
+                    gridded_dims,
+                    state.atmosphere_specific_humidity,
+                    {
+                        "long_name": "Atmosphere specific humidity",
+                        "units": "kg kg^-1",
+                    },
+                ),
+
             },
             coords = {
                 "time" : (
